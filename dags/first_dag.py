@@ -6,62 +6,63 @@ import requests
 import psycopg2
 import logging
 
-
 # -------------------------
-# CONFIG (with fallback)
+# CONFIG
 # -------------------------
 API_URL = Variable.get(
     "API_URL",
     default_var="https://jsonplaceholder.typicode.com/posts"
 )
 
-
-# -------------------------
-# LOGGING
-# -------------------------
 logger = logging.getLogger(__name__)
 
+# -------------------------
+# TELEGRAM
+# -------------------------
+def send_telegram(message):
+    token = Variable.get("TELEGRAM_TOKEN", default_var="")
+    chat_id = Variable.get("TELEGRAM_CHAT_ID", default_var="")
+
+    if not token or not chat_id:
+        logger.warning("Telegram not configured")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    requests.post(
+        url,
+        json={"chat_id": chat_id, "text": message},
+        timeout=5
+    )
+
+def notify_success():
+    send_telegram("✅ Pipeline completed successfully!")
+
+def notify_failure(context):
+    task = context['task_instance'].task_id
+    send_telegram(f"❌ Task Failed: {task}")
 
 # -------------------------
-# TASK 1: Fetch API Data
+# TASKS
 # -------------------------
 def fetch_data(**context):
-    try:
-        response = requests.get(API_URL, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+    response = requests.get(API_URL, timeout=10)
+    response.raise_for_status()
+    data = response.json()
 
-        logger.info(f"Fetched {len(data)} records")
+    logger.info(f"Fetched {len(data)} records")
+    context['ti'].xcom_push(key='raw_data', value=data)
 
-        context['ti'].xcom_push(key='raw_data', value=data)
-
-    except Exception as e:
-        logger.error(f"API Fetch Failed: {e}")
-        raise
-
-
-# -------------------------
-# TASK 2: Validate Data
-# -------------------------
 def validate_data(**context):
     data = context['ti'].xcom_pull(task_ids='fetch_data', key='raw_data')
 
     if not data or not isinstance(data, list):
         raise ValueError("Invalid API data")
 
-    logger.info("Data validation passed")
-
     context['ti'].xcom_push(key='validated_data', value=data)
 
-
-# -------------------------
-# TASK 3: Transform Data
-# -------------------------
 def transform_data(**context):
     data = context['ti'].xcom_pull(task_ids='validate_data', key='validated_data')
-
-    if data is None:
-        raise ValueError("No data received from validate_data")
 
     transformed = [
         {
@@ -72,22 +73,10 @@ def transform_data(**context):
         for item in data[:10]
     ]
 
-    if not transformed:
-        raise ValueError("Transformation resulted in empty data")
-
-    # 🔥 IMPORTANT (ensure push happens)
     context['ti'].xcom_push(key='final_data', value=transformed)
 
-    print(f"Transformed {len(transformed)} records")  # debug
-
-# -------------------------
-# TASK 4: Store in DB
-# -------------------------
 def store_data(**context):
     data = context['ti'].xcom_pull(task_ids='transform_data', key='final_data')
-
-    if data is None:
-        raise ValueError("No data received from transform_data")
 
     conn = psycopg2.connect(
         host="postgres",
@@ -95,7 +84,6 @@ def store_data(**context):
         user="airflow",
         password="airflow"
     )
-
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -120,12 +108,6 @@ def store_data(**context):
     cursor.close()
     conn.close()
 
-    logger.info("Data stored in DB")
-
-
-# -------------------------
-# TASK 5: Data Quality Check
-# -------------------------
 def data_quality_check():
     conn = psycopg2.connect(
         host="postgres",
@@ -133,7 +115,6 @@ def data_quality_check():
         user="airflow",
         password="airflow"
     )
-
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM posts")
     count = cursor.fetchone()[0]
@@ -142,24 +123,10 @@ def data_quality_check():
     conn.close()
 
     if count < 5:
-        raise ValueError("Data quality check failed")
-
-    logger.info(f"Data quality passed with {count} records")
-
+        raise ValueError("Data quality failed")
 
 # -------------------------
-# TASK 6: Notifications
-# -------------------------
-def notify_success():
-    print("✅ Pipeline completed successfully!")
-
-
-def notify_failure(context):
-    print(f"❌ Pipeline failed: {context}")
-
-
-# -------------------------
-# DEFAULT ARGS
+# DAG
 # -------------------------
 default_args = {
     "retries": 2,
@@ -167,74 +134,20 @@ default_args = {
     "on_failure_callback": notify_failure
 }
 
-
-# -------------------------
-# DAG
-# -------------------------
 with DAG(
     dag_id="advanced_api_pipeline",
     start_date=datetime(2024, 1, 1),
     schedule="@daily",
     catchup=False,
     default_args=default_args,
-    tags=["production", "api", "etl"]
+    tags=["production", "etl"]
 ) as dag:
 
-    fetch = PythonOperator(
-        task_id="fetch_data",
-        python_callable=fetch_data
-    )
-
-    validate = PythonOperator(
-        task_id="validate_data",
-        python_callable=validate_data
-    )
-
-    transform = PythonOperator(
-        task_id="transform_data",
-        python_callable=transform_data
-    )
-
-    store = PythonOperator(
-        task_id="store_data",
-        python_callable=store_data
-    )
-
-    quality = PythonOperator(
-        task_id="data_quality_check",
-        python_callable=data_quality_check
-    )
-
-    success = PythonOperator(
-        task_id="notify_success",
-        python_callable=notify_success
-    )
+    fetch = PythonOperator(task_id="fetch_data", python_callable=fetch_data)
+    validate = PythonOperator(task_id="validate_data", python_callable=validate_data)
+    transform = PythonOperator(task_id="transform_data", python_callable=transform_data)
+    store = PythonOperator(task_id="store_data", python_callable=store_data)
+    quality = PythonOperator(task_id="data_quality_check", python_callable=data_quality_check)
+    success = PythonOperator(task_id="notify_success", python_callable=notify_success)
 
     fetch >> validate >> transform >> store >> quality >> success
-
-import requests
-from airflow.models import Variable
-
-
-def send_telegram(message):
-    token = Variable.get("TELEGRAM_TOKEN")
-    chat_id = Variable.get("TELEGRAM_CHAT_ID")
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    response = requests.post(
-        url,
-        json={"chat_id": chat_id, "text": message},
-        timeout=5
-    )
-
-    print(response.text)  # debug
-
-
-def notify_success():
-    send_telegram("✅ Pipeline completed successfully!")
-
-
-def notify_failure(context):
-    task = context['task_instance'].task_id
-    send_telegram(f"❌ Task Failed: {task}")
